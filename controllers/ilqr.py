@@ -23,8 +23,9 @@ class Controller(BaseController):
   iterating a few times. CPU-feasible: ~N model calls/step (not MPPI's K*N).
   """
 
-  def __init__(self, N=25, iters=3, r_ctrl=0.4):
-    self.N, self.iters, self.r = N, iters, r_ctrl
+  def __init__(self, N=25, iters=3, r_ctrl=0.05, r_du=2.0):
+    self.N, self.iters, self.r, self.r_du = N, iters, r_ctrl, r_du
+    self.prev_applied = 0.0
     self.tok = LataccelTokenizer()
     p = Path(__file__).resolve().parent.parent / "models" / "tinyphysics.onnx"
     so = ort.SessionOptions(); so.log_severity_level = 3
@@ -33,15 +34,39 @@ class Controller(BaseController):
     self.nominal = None
     self.ei = 0.0; self.pe = 0.0
 
+  # Predict the next lataccel distribution given M states and tokens. This is a wrapper 
+  # around the ONNX model, which takes in the current state and token inputs and produces 
+  # a probability distribution over the next lataccel values. The logits are obtained 
+  # from the ONNX model, and then converted to probabilities using a softmax function. 
+  # The predicted lataccel is then computed as the expected value of the lataccel 
+  # distribution, which is the dot product of the probabilities with the corresponding 
+  # lataccel values in BINS.
   def _predict(self, states, tokens):                       # (M,CTX,4),(M,CTX) -> (M,)
     logits = self.sess.run(None, {'states': states, 'tokens': tokens})[0][:, -1, :]
     z = logits / TEMP; z -= z.max(1, keepdims=True)
     p = np.exp(z); p /= p.sum(1, keepdims=True)
     return p @ BINS
 
+  # Roll M control sequences U (M,N) through the true plant. exo = (roll,v,a) arrays 
+  # length N+1 (index 0 = current step). Returns lat (M,N). This function simulates 
+  # the true plant dynamics by rolling out M control sequences through the model. It 
+  # takes in the control sequences U, the exogenous variables (roll, velocity, 
+  # acceleration), and the previous lataccel value. It iteratively computes the next 
+  # lataccel value at each time step by feeding the current state and control inputs 
+  # into the model, while also applying the necessary constraints on the lataccel 
+  # values to ensure they do not change too rapidly. The function returns the predicted 
+  # lataccel values for each control sequence over the horizon N.
   def _rollout(self, U, exo, x0_prev):
     """Roll M control sequences U (M,N) through the true plant.
     exo = (roll,v,a) arrays length N+1 (index 0 = current step). Returns lat (M,N)."""
+    # warm start: stable half-gain feed-forward (the FFB family that gives ~72) on the 
+    # first iter, then we will have a better nominal from the previous iter's rollout. 
+    # The warm start is important for convergence, as it provides a reasonable initial 
+    # guess for the control sequence that is close to the optimal solution. By using a 
+    # stable half-gain feed-forward control law based on the current state and target 
+    # lataccel, we can ensure that the initial control sequence is not too far from 
+    # the optimal trajectory, which helps the iterative optimization process converge 
+    # more quickly and reliably.
     M, N = U.shape
     roll, v, a = exo
     ba = np.asarray(self.Acts[-(CTX - 1):], dtype=np.float32)
@@ -77,6 +102,14 @@ class Controller(BaseController):
                         STEER_RANGE[0], STEER_RANGE[1])); self.Acts.append(u); return u
 
     N = self.N
+    # Construct the exogenous variables for the rollout, which include the roll, velocity, and acceleration 
+    # for each time step in the horizon. These variables are necessary for simulating the plant dynamics 
+    # accurately, as they provide the model with the necessary context about the current state and the 
+    # expected future states. The exogenous variables are constructed by taking the current state and the 
+    # future plan, and creating arrays for roll, velocity, and acceleration that span the entire horizon of 
+    # the control sequence. This allows the rollout function to simulate the plant dynamics over the horizon 
+    # while accounting for the expected changes in these variables, which is crucial for generating an 
+    # accurate nominal trajectory for the iterative optimization process.
     def seq(cur, lst):
       o = [cur] + (list(lst) if lst else []); o += [o[-1]] * (N + 1 - len(o)); return np.asarray(o[:N + 1])
     roll = seq(state.roll_lataccel, getattr(future_plan, "roll_lataccel", None))
@@ -105,6 +138,7 @@ class Controller(BaseController):
     # lataccel-jerk difference operator on [x_0..x_{N-1}] with x_{-1}=current
     Diff = np.eye(N) - np.eye(N, k=-1)
     DG = Diff @ G
+    Du = np.eye(N) - np.eye(N, k=-1)        # steer-rate operator (row0 = u_0 - prev_applied)
 
     u = self.nominal.copy()
     xbar = self._rollout(u[None, :], exo, current_lataccel)[0]              # TRUE nominal (N,)
@@ -112,8 +146,9 @@ class Controller(BaseController):
     alphas = np.array([1.0, 0.5, 0.25, 0.1])
     for _ in range(self.iters):
       jerk0 = np.empty(N); jerk0[0] = xbar[0] - current_lataccel; jerk0[1:] = xbar[1:] - xbar[:-1]
-      Astack = np.vstack([W_LAT * G, W_JERK * DG, np.sqrt(self.r) * np.eye(N)])
-      bstack = np.concatenate([W_LAT * (tgt - xbar), -W_JERK * jerk0, np.zeros(N)])
+      rate0 = Du @ u; rate0[0] = u[0] - self.prev_applied      # steer rates of current nominal
+      Astack = np.vstack([W_LAT * G, W_JERK * DG, np.sqrt(self.r_du) * Du, np.sqrt(self.r) * np.eye(N)])
+      bstack = np.concatenate([W_LAT * (tgt - xbar), -W_JERK * jerk0, -np.sqrt(self.r_du) * rate0, np.zeros(N)])
       du, *_ = np.linalg.lstsq(Astack, bstack, rcond=None)
       # batched backtracking line search: accept the alpha that most reduces TRUE cost
       Ucand = np.clip(u[None, :] + alphas[:, None] * du[None, :], STEER_RANGE[0], STEER_RANGE[1])
@@ -127,5 +162,6 @@ class Controller(BaseController):
 
     u0 = float(u[0])
     self.nominal = np.concatenate([u[1:], u[-1:]])
+    self.prev_applied = u0
     self.Acts.append(u0)
     return u0
