@@ -23,8 +23,8 @@ class Controller(BaseController):
   Applied each step: action = ffb_ff + PID(real error) + residual[pos].
   """
 
-  def __init__(self, N=30, B=4, sigma_noise=0.02, replan_every=5, max_iters=20, warm_iters=10,
-               lr=0.05, l2=6.0, tol=2e-3, sigma_tok=0.03, err_gate=0.06, device="cpu", seed=0):
+  def __init__(self, N=30, B=4, sigma_noise=0.02, replan_every=4, max_iters=80, warm_iters=35,
+               lr=0.06, l2=1.5, tol=1e-3, sigma_tok=0.03, err_gate=0.03, device="cpu", seed=0):
     self.dev = torch.device(device)
     self.gm = build_soft_plant(self.dev); self.bins = make_bins(self.dev)
     self.N, self.B, self.K = N, B, replan_every
@@ -47,9 +47,10 @@ class Controller(BaseController):
   def _rollout_cost(self, residual, nom, hist, noise):
     """Differentiable closed-loop rollout with PID baked in. residual (N,) is the
     decision variable; ffb_ff[h], roll/v/a, targets come from `nom`. Returns mean cost."""
-    hs, hl, ha, exo, x0, ffb_ff, tgt, ei0, pe0 = nom
+    _, _, _, exo, x0, ffb_ff, tgt, ei0, pe0 = nom
     B, N = self.B, self.N
-    Wa = hist[0].expand(B, -1).clone(); Ws = hist[1].expand(B, -1, -1).clone(); Wl = hist[2].expand(B, -1).clone()
+    # hist = (states[CTX,3], lat[CTX], actions[CTX-1])
+    Wa = hist[2].expand(B, -1).clone(); Ws = hist[0].expand(B, -1, -1).clone(); Wl = hist[1].expand(B, -1).clone()
     prev = x0.expand(B).clone(); ei = ei0.expand(B).clone(); pe = pe0.expand(B).clone(); xs = []
     for h in range(N):
       err = tgt[h] - prev                 # tracker reacts to simulated error (closed-loop in-graph)
@@ -92,6 +93,7 @@ class Controller(BaseController):
     return u
 
   def _replan(self, target_lataccel, current_lataccel, state, future_plan):
+    self._calls = getattr(self, "_calls", 0) + 1
     N = self.N
     def seq(cur, lst):
       o = [cur] + (list(lst) if lst else []); o += [o[-1]] * (N + 1 - len(o)); return np.asarray(o[:N + 1])
@@ -114,10 +116,15 @@ class Controller(BaseController):
            torch.tensor(self.ei, dtype=torch.float32, device=d),
            torch.tensor(self.pe, dtype=torch.float32, device=d))
     noise = self._antithetic()
-    residual = torch.zeros(N, dtype=torch.float32, device=d, requires_grad=True)
+    # warm-start the residual from the shifted previous one so it accumulates
+    if self.residual is not None and np.any(self.residual):
+      r0 = np.concatenate([self.residual[self.K:], np.zeros(self.K)])[:N]; iters = self.warm_iters
+    else:
+      r0 = np.zeros(N); iters = self.max_iters
+    residual = torch.tensor(r0, dtype=torch.float32, device=d, requires_grad=True)
     opt = torch.optim.Adam([residual], lr=self.lr); prev = float("inf")
     try:
-      for i in range(self.warm_iters if self.residual is not None else self.max_iters):
+      for i in range(iters):
         opt.zero_grad()
         loss = self._rollout_cost(residual, nom, hist, noise) + self.l2 * (residual ** 2).sum()
         loss.backward(); opt.step()
@@ -127,7 +134,11 @@ class Controller(BaseController):
       with torch.no_grad():
         c_opt = float(self._rollout_cost(residual, nom, hist, noise))
         c_base = float(self._rollout_cost(torch.zeros(N, device=d), nom, hist, noise))   # FFB+PID floor
-      self.residual = residual.detach().cpu().numpy() if (np.isfinite(c_opt) and c_opt < c_base) else np.zeros(N)
-    except Exception:
+      kept = np.isfinite(c_opt) and c_opt < c_base
+      if not hasattr(self, "_log"): self._log = []
+      self._log.append((c_base, c_opt, kept, float(np.abs(residual.detach().cpu().numpy()).mean())))
+      self.residual = residual.detach().cpu().numpy() if kept else np.zeros(N)
+    except Exception as e:
+      self._err = repr(e)
       self.residual = np.zeros(N)
     self.pos = 0
