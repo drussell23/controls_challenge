@@ -3,3 +3,7 @@ data/
 report.html
 models/tinyphysics_*.onnx
 *.swp
+synth.zip
+*.zip
+*.npy
+*.onnx.tmp
