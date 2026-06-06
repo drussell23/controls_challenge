@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import torch.nn.functional as F
 from . import BaseController
 from .torch_plant import build_soft_plant, make_bins, soft_encode
 from tinyphysics import CONTEXT_LENGTH as CTX, MAX_ACC_DELTA, STEER_RANGE, DEL_T
@@ -23,8 +24,10 @@ class Controller(BaseController):
   Applied each step: action = ffb_ff + PID(real error) + residual[pos].
   """
 
-  def __init__(self, N=30, B=4, sigma_noise=0.02, replan_every=4, max_iters=80, warm_iters=35,
-               lr=0.06, l2=1.5, tol=1e-3, sigma_tok=0.03, err_gate=0.03, device="cpu", seed=0):
+  def __init__(self, N=30, B=4, sigma_noise=0.02, replan_every=4, max_iters=40, warm_iters=20,
+               lr=0.08, l2=0.5, jerk_w=2.0, n_cp=4, tol=1e-3, sigma_tok=0.03, err_gate=0.03,
+               device="cpu", seed=0):
+    self.jerk_w, self.n_cp = jerk_w, n_cp
     self.dev = torch.device(device)
     self.gm = build_soft_plant(self.dev); self.bins = make_bins(self.dev)
     self.N, self.B, self.K = N, B, replan_every
@@ -32,7 +35,7 @@ class Controller(BaseController):
     self.lr, self.l2, self.tol, self.sigma_tok, self.err_gate = lr, l2, tol, sigma_tok, err_gate
     self.g = torch.Generator(device=self.dev).manual_seed(seed)
     self.S, self.L, self.Acts = [], [], []
-    self.residual = None; self.pos = 0
+    self.residual = None; self.prev_cp = None; self.pos = 0
     self.ei = 0.0; self.pe = 0.0          # real tracker PID state
 
   def _antithetic(self):
@@ -116,29 +119,36 @@ class Controller(BaseController):
            torch.tensor(self.ei, dtype=torch.float32, device=d),
            torch.tensor(self.pe, dtype=torch.float32, device=d))
     noise = self._antithetic()
-    # warm-start the residual from the shifted previous one so it accumulates
-    if self.residual is not None and np.any(self.residual):
-      r0 = np.concatenate([self.residual[self.K:], np.zeros(self.K)])[:N]; iters = self.warm_iters
+    # SPLINE / latent parameterization: optimize n_cp control points -> smooth residual
+    # (mathematically bars high-frequency OOD-exploiting actions)
+    def expand(cp):
+      return F.interpolate(cp.view(1, 1, -1), size=N, mode='linear', align_corners=True).view(N)
+    if self.prev_cp is not None:
+      cp = torch.tensor(self.prev_cp, dtype=torch.float32, device=d, requires_grad=True); iters = self.warm_iters
     else:
-      r0 = np.zeros(N); iters = self.max_iters
-    residual = torch.tensor(r0, dtype=torch.float32, device=d, requires_grad=True)
-    opt = torch.optim.Adam([residual], lr=self.lr); prev = float("inf")
+      cp = torch.zeros(self.n_cp, dtype=torch.float32, device=d, requires_grad=True); iters = self.max_iters
+    opt = torch.optim.Adam([cp], lr=self.lr); prev = float("inf")
     try:
       for i in range(iters):
         opt.zero_grad()
-        loss = self._rollout_cost(residual, nom, hist, noise) + self.l2 * (residual ** 2).sum()
+        res = expand(cp)
+        jerk = (torch.diff(res) ** 2).sum()
+        loss = self._rollout_cost(res, nom, hist, noise) + self.l2 * (cp ** 2).sum() + self.jerk_w * jerk
         loss.backward(); opt.step()
         l = float(loss.detach())
         if i >= 2 and abs(prev - l) / max(prev, 1.0) < self.tol: break
         prev = l
       with torch.no_grad():
-        c_opt = float(self._rollout_cost(residual, nom, hist, noise))
+        res = expand(cp)
+        c_opt = float(self._rollout_cost(res, nom, hist, noise))
         c_base = float(self._rollout_cost(torch.zeros(N, device=d), nom, hist, noise))   # FFB+PID floor
       kept = np.isfinite(c_opt) and c_opt < c_base
       if not hasattr(self, "_log"): self._log = []
-      self._log.append((c_base, c_opt, kept, float(np.abs(residual.detach().cpu().numpy()).mean())))
-      self.residual = residual.detach().cpu().numpy() if kept else np.zeros(N)
+      self._log.append((c_base, c_opt, kept, float(cp.detach().abs().mean())))
+      if kept:
+        self.residual = res.detach().cpu().numpy(); self.prev_cp = cp.detach().cpu().numpy()
+      else:
+        self.residual = np.zeros(N); self.prev_cp = None
     except Exception as e:
-      self._err = repr(e)
-      self.residual = np.zeros(N)
+      self._err = repr(e); self.residual = np.zeros(N); self.prev_cp = None
     self.pos = 0
